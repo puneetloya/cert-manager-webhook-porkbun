@@ -1,6 +1,6 @@
 module github.com/bcspragu/cert-manager-webhook-porkbun
 
-go 1.19
+go 1.23
 
 require (
 	github.com/cert-manager/cert-manager v1.11.3

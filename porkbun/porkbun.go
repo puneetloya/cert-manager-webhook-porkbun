@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -39,6 +40,8 @@ type PingResponse struct {
 }
 
 func (c *Client) Ping(ctx context.Context) (*PingResponse, error) {
+	slog.Debug("porkbun API: ping request")
+
 	var req bytes.Buffer
 	if err := json.NewEncoder(&req).Encode(c.baseRequest()); err != nil {
 		return nil, fmt.Errorf("failed to encode request: %w", err)
@@ -46,6 +49,7 @@ func (c *Client) Ping(ctx context.Context) (*PingResponse, error) {
 
 	httpResp, err := ctxhttp.Post(ctx, c.http, baseURL+"ping", "application/json", &req)
 	if err != nil {
+		slog.Error("porkbun API: ping request failed", "error", err)
 		return nil, fmt.Errorf("failed to hit ping endpoint: %w", err)
 	}
 	defer httpResp.Body.Close()
@@ -54,6 +58,8 @@ func (c *Client) Ping(ctx context.Context) (*PingResponse, error) {
 	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
 	}
+
+	slog.Debug("porkbun API: ping response", "status", resp.Status)
 	return resp, nil
 }
 
@@ -66,6 +72,7 @@ func (c *Client) baseRequest() *BaseRequest {
 
 type RetrieveDNSRecordsResponse struct {
 	Status  string      `json:"status"`
+	Message string      `json:"message,omitempty"`
 	Records []DNSRecord `json:"records"`
 }
 
@@ -101,6 +108,8 @@ func (c *Client) RetrieveDNSRecordsByDomainSubdomainType(ctx context.Context, do
 }
 
 func (c *Client) retrieveDNSRecords(ctx context.Context, path string) (*RetrieveDNSRecordsResponse, error) {
+	slog.Debug("porkbun API: retrieve DNS records", "path", path)
+
 	var req bytes.Buffer
 	if err := json.NewEncoder(&req).Encode(c.baseRequest()); err != nil {
 		return nil, fmt.Errorf("failed to encode request: %w", err)
@@ -108,6 +117,7 @@ func (c *Client) retrieveDNSRecords(ctx context.Context, path string) (*Retrieve
 
 	httpResp, err := ctxhttp.Post(ctx, c.http, baseURL+path, "application/json", &req)
 	if err != nil {
+		slog.Error("porkbun API: retrieve DNS records failed", "path", path, "error", err)
 		return nil, fmt.Errorf("failed to hit retrieve DNS records endpoint: %w", err)
 	}
 	defer httpResp.Body.Close()
@@ -116,6 +126,11 @@ func (c *Client) retrieveDNSRecords(ctx context.Context, path string) (*Retrieve
 	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
 	}
+
+	slog.Debug("porkbun API: retrieve DNS records response",
+		"status", resp.Status,
+		"message", resp.Message,
+		"recordCount", len(resp.Records))
 	return resp, nil
 }
 
@@ -133,14 +148,21 @@ type CreateDNSRecordRequest struct {
 }
 
 type CreateDNSRecordResponse struct {
-	Status string `json:"status"`
-	ID     int    `json:"id"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
+	ID      int    `json:"id"`
 }
 
 func (c *Client) CreateDNSRecord(ctx context.Context, domain string, record *NewDNSRecord) (*CreateDNSRecordResponse, error) {
 	if strings.Contains(domain, "/") {
 		return nil, errors.New("invalid domain given")
 	}
+
+	slog.Debug("porkbun API: create DNS record",
+		"domain", domain,
+		"name", record.Name,
+		"type", record.Type,
+		"ttl", record.TTL)
 
 	createReq := &CreateDNSRecordRequest{
 		BaseRequest:  c.baseRequest(),
@@ -153,6 +175,7 @@ func (c *Client) CreateDNSRecord(ctx context.Context, domain string, record *New
 
 	httpResp, err := ctxhttp.Post(ctx, c.http, baseURL+"dns/create/"+domain, "application/json", &req)
 	if err != nil {
+		slog.Error("porkbun API: create DNS record failed", "domain", domain, "error", err)
 		return nil, fmt.Errorf("failed to hit reate DNS record endpoint: %w", err)
 	}
 	defer httpResp.Body.Close()
@@ -161,11 +184,17 @@ func (c *Client) CreateDNSRecord(ctx context.Context, domain string, record *New
 	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
 	}
+
+	slog.Debug("porkbun API: create DNS record response",
+		"status", resp.Status,
+		"message", resp.Message,
+		"recordId", resp.ID)
 	return resp, nil
 }
 
 type DeleteDNSRecordResponse struct {
-	Status string `json:"status"`
+	Status  string `json:"status"`
+	Message string `json:"message,omitempty"`
 }
 
 func (c *Client) DeleteDNSRecordByDomainID(ctx context.Context, domain, id string) (*DeleteDNSRecordResponse, error) {
@@ -176,6 +205,8 @@ func (c *Client) DeleteDNSRecordByDomainID(ctx context.Context, domain, id strin
 		return nil, errors.New("invalid id given")
 	}
 
+	slog.Debug("porkbun API: delete DNS record", "domain", domain, "recordId", id)
+
 	var req bytes.Buffer
 	if err := json.NewEncoder(&req).Encode(c.baseRequest()); err != nil {
 		return nil, fmt.Errorf("failed to encode request: %w", err)
@@ -183,6 +214,7 @@ func (c *Client) DeleteDNSRecordByDomainID(ctx context.Context, domain, id strin
 
 	httpResp, err := ctxhttp.Post(ctx, c.http, baseURL+"dns/delete/"+domain+"/"+id, "application/json", &req)
 	if err != nil {
+		slog.Error("porkbun API: delete DNS record failed", "domain", domain, "recordId", id, "error", err)
 		return nil, fmt.Errorf("failed to hit delete DNS record endpoint: %w", err)
 	}
 	defer httpResp.Body.Close()
@@ -191,5 +223,7 @@ func (c *Client) DeleteDNSRecordByDomainID(ctx context.Context, domain, id strin
 	if err := json.NewDecoder(httpResp.Body).Decode(&resp); err != nil {
 		return nil, fmt.Errorf("failed to decode JSON response: %w", err)
 	}
+
+	slog.Debug("porkbun API: delete DNS record response", "status", resp.Status)
 	return resp, nil
 }

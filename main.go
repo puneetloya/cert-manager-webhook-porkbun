@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -22,8 +22,32 @@ import (
 )
 
 func main() {
+	// Configure log level from environment (default: info)
+	logLevel := slog.LevelInfo
+	if level := os.Getenv("LOG_LEVEL"); level != "" {
+		switch strings.ToLower(level) {
+		case "debug":
+			logLevel = slog.LevelDebug
+		case "info":
+			logLevel = slog.LevelInfo
+		case "warn", "warning":
+			logLevel = slog.LevelWarn
+		case "error":
+			logLevel = slog.LevelError
+		}
+	}
+
+	// Initialize structured logger with JSON output for production
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: logLevel,
+	}))
+	slog.SetDefault(logger)
+
+	slog.Info("starting cert-manager-webhook-porkbun", "logLevel", logLevel.String())
+
 	if err := run(); err != nil {
-		log.Fatal(err)
+		slog.Error("fatal error", "error", err)
+		os.Exit(1)
 	}
 }
 
@@ -32,6 +56,8 @@ func run() error {
 	if groupName == "" {
 		return errors.New("GROUP_NAME must be specified")
 	}
+
+	slog.Info("webhook configuration loaded", "groupName", groupName)
 
 	// This will register our custom DNS provider with the webhook serving
 	// library, making it available as an API under the provided GroupName.
@@ -89,8 +115,17 @@ func (p *porkbunDNSProviderSolver) Name() string {
 func (p *porkbunDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	ctx := context.Background()
 
+	slog.Info("Present called - attempting to create DNS TXT record",
+		"resolvedZone", ch.ResolvedZone,
+		"resolvedFQDN", ch.ResolvedFQDN,
+		"resourceNamespace", ch.ResourceNamespace,
+		"allowAmbientCredentials", ch.AllowAmbientCredentials)
+
 	pbClient, err := p.newPorkbunClient(ch)
 	if err != nil {
+		slog.Error("failed to initialize Porkbun client",
+			"error", err,
+			"resourceNamespace", ch.ResourceNamespace)
 		return fmt.Errorf("failed to init Porkbun client: %w", err)
 	}
 
@@ -98,12 +133,34 @@ func (p *porkbunDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error 
 	subDomain := getSubDomain(domain, ch.ResolvedFQDN)
 	target := ch.Key
 
+	slog.Info("parsed challenge request",
+		"domain", domain,
+		"subdomain", subDomain,
+		"targetKeyLength", len(target))
+
 	recordsResp, err := pbClient.RetrieveDNSRecordsByDomainSubdomainType(ctx, domain, subDomain, "TXT")
 	if err != nil {
+		slog.Error("failed to retrieve DNS records from Porkbun",
+			"domain", domain,
+			"subdomain", subDomain,
+			"error", err)
 		return fmt.Errorf("failed to get DNS records: %w", err)
 	}
+
+	slog.Info("retrieved existing DNS records",
+		"domain", domain,
+		"subdomain", subDomain,
+		"status", recordsResp.Status,
+		"message", recordsResp.Message,
+		"recordCount", len(recordsResp.Records))
+
 	if recordsResp.Status != "SUCCESS" {
-		return fmt.Errorf("invalid status %q loading DNS records", recordsResp.Status)
+		slog.Error("Porkbun API returned non-success status when retrieving records",
+			"status", recordsResp.Status,
+			"message", recordsResp.Message,
+			"domain", domain,
+			"subdomain", subDomain)
+		return fmt.Errorf("invalid status %q loading DNS records: %s", recordsResp.Status, recordsResp.Message)
 	}
 
 	for _, rec := range recordsResp.Records {
@@ -111,9 +168,16 @@ func (p *porkbunDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error 
 			continue
 		}
 		// The record already exists, just return.
-		fmt.Printf("record %s.%s IN TXT already exists, returning\n", subDomain, domain)
+		slog.Info("DNS TXT record already exists, skipping creation",
+			"subdomain", subDomain,
+			"domain", domain,
+			"recordId", rec.ID)
 		return nil
 	}
+
+	slog.Info("no existing TXT record found, creating new record",
+		"domain", domain,
+		"subdomain", subDomain)
 
 	createResp, err := pbClient.CreateDNSRecord(ctx, domain, &porkbun.NewDNSRecord{
 		Name:    subDomain,
@@ -122,11 +186,29 @@ func (p *porkbunDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error 
 		TTL:     "60",
 	})
 	if err != nil {
+		slog.Error("failed to create DNS record",
+			"domain", domain,
+			"subdomain", subDomain,
+			"error", err)
 		return fmt.Errorf("failed to create DNS record: %w", err)
 	}
+
+	slog.Info("Porkbun API create record response",
+		"status", createResp.Status,
+		"recordId", createResp.ID)
+
 	if createResp.Status != "SUCCESS" {
+		slog.Error("Porkbun API returned non-success status when creating record",
+			"status", createResp.Status,
+			"domain", domain,
+			"subdomain", subDomain)
 		return fmt.Errorf("invalid status %q creating DNS record", createResp.Status)
 	}
+
+	slog.Info("DNS TXT record created successfully",
+		"subdomain", subDomain,
+		"domain", domain,
+		"recordId", createResp.ID)
 
 	return nil
 }
@@ -163,23 +245,68 @@ func (p *porkbunDNSProviderSolver) newPorkbunClient(ch *v1alpha1.ChallengeReques
 		return nil, err
 	}
 
+	// Validate that credentials are present before making API calls
+	if apiKey == "" {
+		slog.Error("porkbun API key is empty - cannot authenticate with Porkbun API",
+			"configuredSecretName", cfg.APIKey.Name,
+			"configuredSecretKey", cfg.APIKey.Key,
+			"namespace", ch.ResourceNamespace)
+		return nil, errors.New("porkbun API key is empty: check that the secret exists and contains the correct key")
+	}
+
+	if secretAPIKey == "" {
+		slog.Error("porkbun secret API key is empty - cannot authenticate with Porkbun API",
+			"configuredSecretName", cfg.SecretAPIKey.Name,
+			"configuredSecretKey", cfg.SecretAPIKey.Key,
+			"namespace", ch.ResourceNamespace)
+		return nil, errors.New("porkbun secret API key is empty: check that the secret exists and contains the correct key")
+	}
+
+	slog.Info("porkbun client credentials loaded successfully",
+		"apiKeyLength", len(apiKey),
+		"secretApiKeyLength", len(secretAPIKey),
+		"namespace", ch.ResourceNamespace)
+
 	return porkbun.New(secretAPIKey, apiKey), nil
 }
 
 func (p *porkbunDNSProviderSolver) secret(ctx context.Context, ref corev1.SecretKeySelector, namespace string) (string, error) {
 	if ref.Name == "" {
+		slog.Warn("secret reference name is empty, no credential will be loaded",
+			"namespace", namespace,
+			"key", ref.Key)
 		return "", nil
 	}
 
+	slog.Debug("loading secret",
+		"secretName", ref.Name,
+		"secretKey", ref.Key,
+		"namespace", namespace)
+
 	secret, err := p.client.CoreV1().Secrets(namespace).Get(ctx, ref.Name, metav1.GetOptions{})
 	if err != nil {
+		slog.Error("failed to load secret from kubernetes",
+			"secretName", ref.Name,
+			"namespace", namespace,
+			"error", err)
 		return "", fmt.Errorf("failed to load secret: %w", err)
 	}
 
 	bytes, ok := secret.Data[ref.Key]
 	if !ok {
+		slog.Error("key not found in secret",
+			"key", ref.Key,
+			"secretName", ref.Name,
+			"namespace", namespace,
+			"availableKeys", getSecretKeys(secret.Data))
 		return "", fmt.Errorf("key not found %q in secret '%s/%s'", ref.Key, namespace, ref.Name)
 	}
+
+	slog.Debug("secret loaded successfully",
+		"secretName", ref.Name,
+		"secretKey", ref.Key,
+		"namespace", namespace,
+		"valueLength", len(bytes))
 
 	return string(bytes), nil
 }
@@ -233,6 +360,11 @@ func (p *porkbunDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error 
 		if deleteResp.Status != "SUCCESS" {
 			return fmt.Errorf("invalid status %q deleting DNS record %q", recordsResp.Status, rec.ID)
 		}
+
+		slog.Info("DNS TXT record deleted successfully",
+			"subdomain", subDomain,
+			"domain", domain,
+			"recordId", rec.ID)
 	}
 
 	return nil
@@ -248,13 +380,17 @@ func (p *porkbunDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error 
 // The stopCh can be used to handle early termination of the webhook, in cases
 // where a SIGTERM or similar signal is sent to the webhook process.
 func (c *porkbunDNSProviderSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan struct{}) error {
+	slog.Info("initializing porkbun DNS provider solver")
+
 	cl, err := kubernetes.NewForConfig(kubeClientConfig)
 	if err != nil {
+		slog.Error("failed to create kubernetes client", "error", err)
 		return err
 	}
 
 	c.client = cl
 
+	slog.Info("porkbun DNS provider solver initialized successfully")
 	return nil
 }
 
@@ -273,4 +409,13 @@ func loadConfig(cfgJSON *extapi.JSON) (porkbunDNSProviderConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+// getSecretKeys returns the keys available in a secret's data map
+func getSecretKeys(data map[string][]byte) []string {
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	return keys
 }
